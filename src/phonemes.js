@@ -44,7 +44,7 @@ export const phonemeMap = {
 
   er: { f: [550, 1200, 2450, 3300, 4300, 5300], morphTo: [450, 1300, 1700, 3200, 4300, 5300], voiced: true },
   jh:  { f: [260, 1800, 2820, 3600, 4600, 5600], voiced: true, breathy: true, amp: 0.8, noiseAmp: 0.15 },
-  ng: { f: [200, 850,  1950, 3300, 4300, 5300], voiced: true, nasal: true },
+  ng: { f: [270, 2e3, 2700, 3300, 4300, 5300], voiced: true, nasal: true },
 
   oy: { f: [400, 1000, 2600, 3400, 4400, 5400], morphTo: [350, 2200, 2900, 3600, 4500, 5500], voiced: true },
   ow: { f: [400, 1000, 2600, 3400, 4400, 5400], morphTo: [290, 610, 2150, 3300, 4300, 5300], voiced: true },
