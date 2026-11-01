@@ -1,0 +1,52 @@
+{
+  "name": "jssynth-vocal-tools",
+  "version": "1.0.0",
+  "description": "Reusable phoneme, text conversion, and piano-roll utilities from JSSynth",
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js"
+    },
+    "./browser": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js"
+    },
+    "./node-audio": {
+      "types": "./src/node-audio.d.ts",
+      "import": "./src/node-audio.js"
+    },
+    "./phonemes": {
+      "types": "./src/phonemes.d.ts",
+      "import": "./src/phonemes.js"
+    },
+    "./text-phonemizer": {
+      "types": "./src/text-phonemizer.d.ts",
+      "import": "./src/text-phonemizer.js"
+    },
+    "./audio-utils": {
+      "types": "./src/audio-utils.d.ts",
+      "import": "./src/audio-utils.js"
+    },
+    "./piano-roll-utils": {
+      "types": "./src/piano-roll-utils.d.ts",
+      "import": "./src/piano-roll-utils.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "src/"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "node-web-audio-api": "^2.2.0"
+  }
+}
