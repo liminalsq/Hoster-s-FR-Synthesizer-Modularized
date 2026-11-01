@@ -19,6 +19,9 @@ import {
   snapToGrid,
 } from "./piano-roll-utils.js";
 import { getPortamentoStartPitch, noteToFreq, resolvePortamento } from "./audio-utils.js";
+import { renderWithWebGPU } from "./webgpu-renderer.js";
+
+const gpuRenderedBuffers = new WeakSet();
 
 const TALKING_VOWELS = new Set([
   "a", "ax", "ae", "aa", "e", "i", "ee", "o", "u", "y", "uh", "er",
@@ -36,6 +39,9 @@ export async function initializeJSSynth(options = {}) {
   const headless = options.headless === true;
   let sampleRate = options.sampleRate ?? 44100;
   let defaultPitch = options.defaultPitch ?? 120;
+  if (options.gpuAccelerate != null && typeof options.gpuAccelerate !== "boolean") {
+    throw new TypeError("gpuAccelerate must be a boolean.");
+  }
 
   // voice cloning and gender variables
   let genderShift = options.genderShift ?? 0; // -100 (male) to 100 (female)
@@ -49,6 +55,7 @@ export async function initializeJSSynth(options = {}) {
   let consonantDuration = options.consonantDuration ?? 0.05;
   let talkingMode = options.talkingMode ?? false;
   let monotoneMode = options.monotoneMode ?? false;
+  const defaultGpuAccelerate = options.gpuAccelerate ?? false;
 
   // --- Experimental / for-fun options ---
   let disableFormantFilter = options.disableFormantFilter ?? false; // bypass the biquad formant filters
@@ -1247,7 +1254,7 @@ const stopPreview = () => {
   };
 
   // synthesize with nasal-aware transitions and humanizing features
-  const synthesize = async (ctx, phonemeSeq, mode, vibFreq, vibDepth, vibDelay, morphTime = 0.05, morphEnabled = true, slideTime = 0.08, portamento = 0.08, persistentVib = true, dynamicMode = false, consonantDuration = 0.1, globalVibFadeIn = 0, method = synthesisMethod, beatLength = 0.5, oscillatorType = oscType) => {
+  const synthesize = async (ctx, phonemeSeq, mode, vibFreq, vibDepth, vibDelay, morphTime = 0.05, morphEnabled = true, slideTime = 0.08, portamento = 0.08, persistentVib = true, dynamicMode = false, consonantDuration = 0.1, globalVibFadeIn = 0, method = synthesisMethod, beatLength = 0.5, oscillatorType = oscType, gpuAccelerate = false) => {
     if (method === "concatenative") {
       return renderConcatenative(ctx, phonemeSeq, mode, morphTime, morphEnabled, slideTime, portamento, vibFreq, vibDepth, vibDelay, persistentVib, globalVibFadeIn);
     }
@@ -1292,6 +1299,18 @@ const stopPreview = () => {
 
     const totalDuration = processedSeq.reduce((a,p) => a + p.d, 0);
     const endTime = totalDuration;
+
+    if (gpuAccelerate && method === "synthesized") {
+      const gpuBuffer = await renderWithWebGPU(ctx, processedSeq, {
+        mode,
+        oscillatorType,
+        disableFormantFilter,
+      });
+      if (gpuBuffer) {
+        gpuRenderedBuffers.add(gpuBuffer);
+        return gpuBuffer;
+      }
+    }
 
     // master output
     const master = ctx.createGain();
@@ -2178,6 +2197,9 @@ const hasMorphTo = voiceFilters.length > 0 && morphEnabled && opt.morphTo && opt
         throw new RangeError("Sample rate must be an integer between 8000 and 192000 Hz.");
       }
       const method = renderOptions.synthesisMethod ?? synthesisMethod;
+      if (renderOptions.gpuAccelerate != null && typeof renderOptions.gpuAccelerate !== "boolean") {
+        throw new TypeError("gpuAccelerate must be a boolean.");
+      }
       const oscillatorType = renderOptions.oscillatorType ?? renderOptions.oscType ?? oscType;
       if (!["rosenberg", "lf", "sawtooth", "square", "custom"].includes(oscillatorType)) {
         throw new RangeError("Oscillator type must be rosenberg, lf, sawtooth, square, or custom.");
@@ -2207,10 +2229,16 @@ const hasMorphTo = voiceFilters.length > 0 && morphEnabled && opt.morphTo && opt
         renderOptions.vibratoFadeIn ?? 0,
         method,
         60 / (renderOptions.bpm ?? 120),
-        oscillatorType
+        oscillatorType,
+        renderOptions.gpuAccelerate ?? defaultGpuAccelerate
       );
       const samples = resampleAudio(rendered.getChannelData(0), rendered.sampleRate, outputSampleRate);
-      return { samples, sampleRate: outputSampleRate, duration: samples.length / outputSampleRate };
+      return {
+        samples,
+        sampleRate: outputSampleRate,
+        duration: samples.length / outputSampleRate,
+        gpuAccelerated: gpuRenderedBuffers.has(rendered),
+      };
     };
 
     return {
@@ -2337,6 +2365,7 @@ const hasMorphTo = voiceFilters.length > 0 && morphEnabled && opt.morphTo && opt
       <label>Synthesis Method:
         <select id="synthesisMethod"><option value="synthesized" selected>Synthesized</option><option value="concatenative">Concatenative</option></select>
       </label>
+      <label style="margin-left:8px" title="Experimental approximate WebGPU renderer. Uses CPU rendering when WebGPU is unavailable or the render method is unsupported."><input type="checkbox" id="gpuAccelerate" ${defaultGpuAccelerate ? "checked" : ""}/> GPU Accelerated Render</label>
       <label>Voice mode:
         <select id="voiceMode"><option value="voiced" selected>Voiced</option><option value="whisper">Whisper</option></select>
       </label>
@@ -3278,6 +3307,7 @@ vibFadeIn, vibSpeed</pre>
       const vibratoDelay = parseFloat(container.querySelector("#vibDelay").value) || 0;
       const vibratoFadeIn = Math.max(0, parseFloat(container.querySelector("#vibFade").value) || 0);
       const persistentVib = !!container.querySelector("#persistentVib").checked;
+      const gpuAccelerate = !!container.querySelector("#gpuAccelerate").checked;
       const morphTime = Math.max(0, parseFloat(container.querySelector("#morphTime").value) || 0.06);
       const enableMorph = !!container.querySelector("#enableMorph").checked;
       const slideValue = (container.querySelector("#slideTime")?.value ?? "0.08").trim();
@@ -3298,8 +3328,12 @@ vibFadeIn, vibSpeed</pre>
       const renderSampleRate = synthesisMethod === "synthesized" ? 22050 : sampleRate;
       const offlineCtx = new OfflineAudioContext(1, Math.ceil(totalDuration * renderSampleRate) + 128, renderSampleRate);
 
-      const renderedBuffer = await synthesize(offlineCtx, phonemeSeq, mode, vibratoFreq, vibratoDepth, vibratoDelay, morphTime, enableMorph, slideTime, portamento, persistentVib, dynamicMode, consonantDuration, vibratoFadeIn, synthesisMethod, beatLen);
-      statusEl.textContent = "Done";
+      const renderedBuffer = await synthesize(offlineCtx, phonemeSeq, mode, vibratoFreq, vibratoDepth, vibratoDelay, morphTime, enableMorph, slideTime, portamento, persistentVib, dynamicMode, consonantDuration, vibratoFadeIn, synthesisMethod, beatLen, oscType, gpuAccelerate);
+      statusEl.textContent = gpuRenderedBuffers.has(renderedBuffer)
+        ? "Done (WebGPU accelerated)"
+        : gpuAccelerate
+          ? "Done (CPU fallback; WebGPU unavailable or unsupported for this render mode)"
+          : "Done";
 
       // WAV creation & preview
       const audioDataRaw = resampleAudio(renderedBuffer.getChannelData(0), renderedBuffer.sampleRate, sampleRate);
