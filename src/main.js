@@ -20,27 +20,43 @@ import {
 } from "./piano-roll-utils.js";
 import { getPortamentoStartPitch, noteToFreq, resolvePortamento } from "./audio-utils.js";
 
-export async function initializeJSSynth() {
-  let sampleRate = 44100;
+const TALKING_VOWELS = new Set([
+  "a", "ax", "ae", "aa", "e", "i", "ee", "o", "u", "y", "uh", "er",
+  "oy", "ow", "ou", "ay", "aw", "ar", "al", "ao", "aee", "ew", "eu",
+  "ey", "el", "ex", "uw", "ul", "ur", "iw", "il", "ir", "iy", "ih",
+]);
+const TALKING_STOPS = new Set(["b", "bx", "d", "dx", "g", "gx", "k", "p", "t"]);
+const TALKING_FRICATIVES = new Set(["f", "h", "s", "sh", "th", "v", "z", "zh"]);
+const TALKING_LONG_VOWELS = new Set([
+  "aa", "ae", "aee", "ao", "ar", "aw", "ay", "ee", "er", "ey", "iy",
+  "ow", "oy", "uw",
+]);
+
+export async function initializeJSSynth(options = {}) {
+  const headless = options.headless === true;
+  let sampleRate = options.sampleRate ?? 44100;
+  let defaultPitch = options.defaultPitch ?? 120;
 
   // voice cloning and gender variables
-  let genderShift = 0; // -100 (male) to 100 (female)
-  let clonedRatios = null; // ratios for formant scaling from cloned voice
-  let clonedTimbre = { harmonics: 27, duty: 0.65 }; // default
+  let genderShift = options.genderShift ?? 0; // -100 (male) to 100 (female)
+  let clonedRatios = options.clonedRatios ?? null; // ratios for formant scaling from cloned voice
+  let clonedTimbre = options.clonedTimbre ?? { harmonics: 27, duty: 0.65 }; // default
   const standardFormants = [700, 1220, 2600]; // standard formants for 'a'
 
   // personal dictionary and dynamic mode
-  let personalDict = {}; // word -> [phoneme1, phoneme2, ...]
-  let dynamicMode = false;
-  let consonantDuration = 0.05;
+  let personalDict = options.personalDict ?? {}; // word -> [phoneme1, phoneme2, ...]
+  let dynamicMode = options.dynamicMode ?? false;
+  let consonantDuration = options.consonantDuration ?? 0.05;
+  let talkingMode = options.talkingMode ?? false;
+  let monotoneMode = options.monotoneMode ?? false;
 
   // --- Experimental / for-fun options ---
-  let disableFormantFilter = false; // bypass the biquad formant filters
-  let oscType = "rosenberg";        // rosenberg(default) | sawtooth | square | custom
-  let customOscSample = null;       // decoded Float32Array for custom waveform
-  let customOscSampleRate = 44100;
-  let synthesisMethod = "synthesized";
-  const concatenativeSamples = new Map();
+  let disableFormantFilter = options.disableFormantFilter ?? false; // bypass the biquad formant filters
+  let oscType = options.oscillatorType ?? options.oscType ?? "rosenberg";        // rosenberg(default) | sawtooth | square | custom
+  let customOscSample = options.customOscSample ?? null;       // decoded Float32Array for custom waveform
+  let customOscSampleRate = options.customOscSampleRate ?? 44100;
+  let synthesisMethod = options.synthesisMethod ?? "synthesized";
+  const concatenativeSamples = new Map(options.concatenativeSamples ?? []);
   const concatenativeRequiredPhonemes = [
     "a", "ae", "aa", "e", "i", "ee", "o", "u", "y", "w", "r", "l",
     "h", "s", "z", "zh", "t", "d", "dx", "k", "g", "gx", "m", "n", "b", "bx",
@@ -62,6 +78,7 @@ const stopPreview = () => {
       cancelAnimationFrame(previewFrameId);
       previewFrameId = null;
     }
+
     drawPreviewWaveform?.(null);
     if (prevSrc) {
       try {
@@ -102,10 +119,10 @@ const stopPreview = () => {
   }
 
   // load on initialization
-  loadPersonalDict();
+  if (!headless) loadPersonalDict();
 
   // adjust formants for gender and cloning
-  const getAdjustedFormants = (baseF) => {
+  const getAdjustedFormants = (baseF, shift = genderShift) => {
     let f = [...baseF];
     if (clonedRatios) {
       // apply cloned voice ratios (voice cloning only supplies 3 formants, so
@@ -113,7 +130,7 @@ const stopPreview = () => {
       f = f.map((freq, i) => freq * (clonedRatios[i] ?? 1));
     }
     // gender shift: scale frequencies (female higher, male lower)
-    const scale = 1 + (genderShift / 100) * 0.3; // Â±30%
+    const scale = 1 + (shift / 100) * 0.3; // Â±30%
     f = f.map(freq => freq * scale);
     return f;
   };
@@ -175,14 +192,67 @@ const stopPreview = () => {
     clonedTimbre = { harmonics: 27, duty: 0.55 }; // keep default for now
   };
 
-  let useCMUDict = false;
+  let useCMUDict = options.useCMUDict ?? false;
   const { loadCMUDict, textToPhonemes } = createTextPhonemizer({
     getPersonalDict: () => personalDict,
     shouldUseCMUDict: () => useCMUDict,
   });
 
   // parseInput async: supports grid types and uses textToPhonemes for words
-  const parseInput = async (text, beatLen, gridType = "beats", stepsPerBeat = 4) => {
+  const parseInput = async (
+    text,
+    beatLen,
+    gridType = "beats",
+    stepsPerBeat = 4,
+    {
+      dynamicMode: dynamicModeOverride = dynamicMode,
+      consonantDuration: consonantDurationOverride = consonantDuration,
+      genderShift: genderShiftOverride = genderShift,
+      talkingMode: talkingModeOverride = talkingMode,
+      defaultPitch: defaultPitchOverride = defaultPitch,
+      monotoneMode: monotoneModeOverride = monotoneMode,
+    } = {}
+  ) => {
+    if (!Number.isFinite(defaultPitchOverride) || defaultPitchOverride <= 0) {
+      throw new RangeError("Default pitch must be a positive finite frequency in Hz.");
+    }
+    const modeMarkers = /\[(?:mode\s*:\s*)?(talking|monotone|singing)\]/gi;
+    const modeMatches = [...text.matchAll(modeMarkers)];
+    if (modeMatches.length) {
+      const output = [];
+      let activeMode = monotoneModeOverride ? "monotone" : talkingModeOverride ? "talking" : "singing";
+      let segmentStart = 0;
+      let pendingModeBoundary = false;
+      let previousSegmentEnd = null;
+      const appendSegment = async (segment, mode) => {
+        if (!segment.trim()) return;
+        const phonemes = await parseInput(segment, beatLen, gridType, stepsPerBeat, {
+          dynamicMode: dynamicModeOverride,
+          consonantDuration: consonantDurationOverride,
+          genderShift: genderShiftOverride,
+          talkingMode: mode !== "singing",
+          monotoneMode: mode === "monotone",
+          defaultPitch: defaultPitchOverride,
+        });
+        if (phonemes.length && pendingModeBoundary) {
+          phonemes[0].modeBoundaryBefore = true;
+          pendingModeBoundary = false;
+        }
+        output.push(...phonemes);
+        previousSegmentEnd = phonemes.at(-1) ?? previousSegmentEnd;
+      };
+      for (const marker of modeMatches) {
+        const segment = text.slice(segmentStart, marker.index);
+        await appendSegment(segment, activeMode);
+        if (previousSegmentEnd) previousSegmentEnd.modeBoundaryAfter = true;
+        activeMode = marker[1].toLowerCase();
+        pendingModeBoundary = true;
+        segmentStart = marker.index + marker[0].length;
+      }
+      const finalSegment = text.slice(segmentStart);
+      await appendSegment(finalSegment, activeMode);
+      return output;
+    }
   // Token formats:
   // phon <NOTE,duration>     (sets the current pitch)
   // phon <duration>          (reuses the current pitch)
@@ -201,13 +271,22 @@ const stopPreview = () => {
   const parseBracketSettings = (s) => {
     const out = {};
     if (!s) return out;
-    const re = /\b(fs|vd|vf|vde|vdae|vfa|vfao|sl|slide|fm|fmorph|port|portamento|pt)\s*(?::|=)?\s*(auto|-?(?:\d+(?:\.\d*)?|\.\d+))/gi;
+    const re = /\b(fs|vd|vf|vde|vdae|vfa|vfao|sl|slide|fm|fmorph|port|portamento|pt|defaultPitch|osc|oscType|oscillatorType)\s*(?::|=)?\s*(auto|rosenberg|lf|sawtooth|square|custom|-?(?:\d+(?:\.\d*)?|\.\d+))/gi;
     let m;
     while ((m = re.exec(s)) !== null) {
       const rawKey = m[1].toLowerCase();
-      const key = rawKey === "vdae" ? "vde" : rawKey === "sl" ? "slide" : rawKey === "fm" ? "fmorph" : rawKey;
+      const key = rawKey === "vdae" ? "vde"
+        : rawKey === "sl" ? "slide"
+          : rawKey === "fm" ? "fmorph"
+            : rawKey === "defaultpitch" ? "defaultPitch"
+            : rawKey === "osc" || rawKey === "osctype" || rawKey === "oscillatortype" ? "oscillatorType"
+              : rawKey;
       const rawValue = m[2].trim();
-      out[key] = /^auto$/i.test(rawValue) ? "auto" : parseFloat(rawValue);
+      if (key === "oscillatorType") {
+        out[key] = rawValue.toLowerCase();
+      } else {
+        out[key] = /^auto$/i.test(rawValue) ? "auto" : parseFloat(rawValue);
+      }
     }
     return out;
   };
@@ -232,6 +311,12 @@ const stopPreview = () => {
     if (settings.portamento != null) p.portamento = settings.portamento;
     if (settings.port != null) p.portamento = settings.port;
     if (settings.pt != null) p.portamento = settings.pt;
+    if (settings.oscillatorType != null) {
+      if (!["rosenberg", "lf", "sawtooth", "square", "custom"].includes(settings.oscillatorType)) {
+        throw new RangeError("Oscillator type must be rosenberg, lf, sawtooth, square, or custom.");
+      }
+      p.oscillatorType = settings.oscillatorType;
+    }
     p.vibratoOverride = Number.isFinite(settings.vf) || Number.isFinite(settings.vd) ||
       Number.isFinite(settings.vde) || Number.isFinite(settings.vfa) || Number.isFinite(settings.vfao) ||
       vibFreqHz !== null || vibDelayBeats !== null || vibFadeInBeats !== null || vibSpeedBeats !== null;
@@ -241,17 +326,214 @@ const stopPreview = () => {
     if (vibFadeInBeats !== null && Number.isFinite(vibFadeInBeats)) p.vibFadeIn = vibFadeInBeats * beatLen;
   };
 
+    const parseTalkingInput = async () => {
+      const entries = [];
+      const tokens = /(\[[^\]]*\])|([a-zA-Z']+)(?:\s*<\s*([^>]+)\s*>)?|([.,!]+)/g;
+      const baseSettings = {
+        fs: 1, vd: null, vf: null, vde: null, vfa: null, vfao: null,
+        slide: null, fmorph: null, portamento: null,
+        defaultPitch: defaultPitchOverride, oscillatorType: null,
+      };
+      let persistentTalkingSettings = { ...baseSettings };
+      let tokenMatch;
+      while ((tokenMatch = tokens.exec(text)) !== null) {
+        if (tokenMatch[1]) {
+          if (/\breset\b/i.test(tokenMatch[1])) persistentTalkingSettings = { ...baseSettings };
+          Object.assign(persistentTalkingSettings, parseBracketSettings(tokenMatch[1]));
+          if (!Number.isFinite(persistentTalkingSettings.defaultPitch) || persistentTalkingSettings.defaultPitch <= 0) {
+            throw new RangeError("Default pitch must be a positive finite frequency in Hz.");
+          }
+          continue;
+        }
+        if (tokenMatch[4]) {
+          const punctuationRun = tokenMatch[4];
+          entries.push({
+            punctuation: punctuationRun.at(-1),
+            pause: punctuationRun.length > 1 &&
+              [...punctuationRun].every(mark => mark === punctuationRun[0]),
+          });
+          continue;
+        }
+
+        const token = tokenMatch[2].toLowerCase();
+        const fields = tokenMatch[3]?.split(",").map(field => field.trim()) ?? [];
+        const hasExplicitPitch = fields.length > 1;
+        const pitchValue = hasExplicitPitch ? noteToFreq(fields[0]) : null;
+        const durationValue = fields.length
+          ? Number.parseFloat(fields[hasExplicitPitch ? 1 : 0])
+          : null;
+        const hasDurationOverride = Number.isFinite(durationValue) && durationValue > 0;
+        const parts = phonemeMap[token] ? [token] : await textToPhonemes(token);
+        const validParts = parts.map(part => part.toLowerCase()).filter(part => phonemeMap[part]);
+        if (!validParts.length) continue;
+
+        for (let index = 0; index < validParts.length; index++) {
+          entries.push({
+            key: validParts[index],
+            pitch: Number.isFinite(pitchValue) ? pitchValue : null,
+            settings: { ...persistentTalkingSettings },
+            durationUnits: hasDurationOverride
+              ? durationValue / validParts.length
+              : null,
+          });
+        }
+      }
+
+      const phrases = [];
+      let phrase = [];
+      for (const entry of entries) {
+        if (!entry.punctuation) {
+          phrase.push(entry);
+          continue;
+        }
+        if (phrase.length) phrases.push({
+          phones: phrase,
+          punctuation: entry.punctuation,
+          pause: entry.pause,
+        });
+        phrase = [];
+      }
+      if (phrase.length) phrases.push({ phones: phrase, punctuation: "" });
+
+      const output = [];
+      const unitsToSeconds = units => gridType === "seconds"
+        ? units
+        : units * (gridType === "steps" ? beatLen / stepsPerBeat : beatLen);
+      const beatsToUnits = beats => gridType === "steps"
+        ? beats * stepsPerBeat
+        : gridType === "seconds" ? beats * beatLen : beats;
+      const beatsToSeconds = beats => unitsToSeconds(beatsToUnits(beats));
+      let phraseIndex = 0;
+
+      for (const currentPhrase of phrases) {
+        const phones = currentPhrase.phones;
+        const vowelIndices = [];
+        for (let index = 0; index < phones.length; index++) {
+          if (TALKING_VOWELS.has(phones[index].key)) vowelIndices.push(index);
+        }
+        const syllableAt = phones.map((phone, index) => {
+          if (!vowelIndices.length) return 0;
+          let closest = vowelIndices[0];
+          for (const vowelIndex of vowelIndices) {
+            if (Math.abs(vowelIndex - index) < Math.abs(closest - index)) closest = vowelIndex;
+          }
+          return vowelIndices.indexOf(closest);
+        });
+        const cadence = currentPhrase.punctuation === "." ? -2.6
+          : currentPhrase.punctuation === "," ? -0.9
+            : currentPhrase.punctuation === "!" ? 3.2 : 0;
+        const syllablePitches = vowelIndices.map((vowelIndex, syllableIndex) => {
+          const basePitch = phones[vowelIndex].settings.defaultPitch ?? defaultPitchOverride;
+          if (monotoneModeOverride) return basePitch;
+          const deterministicNoise = Math.sin((phraseIndex + 1) * 12.9898 + (syllableIndex + 1) * 78.233) * 0.35;
+          const declination = Math.max(-2.2, 1.1 - syllableIndex * 0.42);
+          return basePitch * 3 ** ((declination + deterministicNoise) / 12);
+        });
+        const lastVoicedIndex = phones.findLastIndex(phone => phonemeMap[phone.key].voiced);
+
+        const targetPitches = phones.map((phone, index) => (
+          Number.isFinite(phone.pitch)
+            ? phone.pitch
+            : syllablePitches[syllableAt[index]] ?? basePitch
+        ));
+        const lastDefaultPitch = phones.at(-1)?.settings.defaultPitch ?? defaultPitchOverride;
+        const cadenceEndPitch = syllablePitches.length
+          ? monotoneModeOverride ? lastDefaultPitch : syllablePitches[syllablePitches.length - 1] * 2 ** (cadence / 12)
+          : lastDefaultPitch * 2 ** (monotoneModeOverride ? 0 : cadence / 12);
+
+        for (let index = 0; index < phones.length; index++) {
+          const phone = phones[index];
+          const mapEntry = phonemeMap[phone.key];
+          let durationSeconds;
+          if (Number.isFinite(phone.durationUnits)) {
+            durationSeconds = unitsToSeconds(phone.durationUnits);
+          } else {
+            let klattDurationMs = TALKING_VOWELS.has(phone.key)
+              ? TALKING_LONG_VOWELS.has(phone.key) ? 160 : 115
+              : TALKING_STOPS.has(phone.key) ? 55
+                : TALKING_FRICATIVES.has(phone.key) ? 90
+                  : mapEntry.nasal || phone.key === "r" || phone.key === "l" ? 78 : 68;
+            const nextKey = phones[index + 1]?.key;
+            if (TALKING_VOWELS.has(phone.key) && TALKING_STOPS.has(nextKey)) {
+              klattDurationMs *= phonemeMap[nextKey].voiced ? 0.88 : 1.18;
+            }
+            if (index === phones.length - 1 || index === phones.length - 2 && !TALKING_VOWELS.has(phones[index + 1]?.key)) {
+              klattDurationMs *= 1.35;
+            }
+            if (vowelIndices.includes(index) && syllableAt[index] === 0) klattDurationMs *= 1.08;
+            const durationBeats = klattDurationMs / 220 * 0.5;
+            durationSeconds = unitsToSeconds(beatsToUnits(durationBeats));
+          }
+          if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) continue;
+
+          const pitch = monotoneModeOverride
+            ? phone.settings.defaultPitch ?? defaultPitchOverride
+            : Number.isFinite(phone.pitch) ? phone.pitch : syllablePitches[syllableAt[index]] ?? defaultPitchOverride;
+          const nextPitch = monotoneModeOverride
+            ? pitch
+            : index === lastVoicedIndex ? cadenceEndPitch
+            : targetPitches[index + 1] ?? cadenceEndPitch;
+          const phoneme = {
+            key: phone.key,
+            ...mapEntry,
+            d: durationSeconds,
+            pitch,
+            pitchEnd: nextPitch,
+            pitchIsNote: false,
+            talkingMode: !monotoneModeOverride,
+            monotoneMode: monotoneModeOverride,
+            dynamicDurationApplied: false,
+          };
+          phoneme.f = getAdjustedFormants(phoneme.f, genderShiftOverride);
+          if (phoneme.morphTo) phoneme.morphTo = getAdjustedFormants(phoneme.morphTo, genderShiftOverride);
+          applyPerNoteVibrato(phoneme, phone.settings, beatLen, null, null, null, null);
+          output.push(phoneme);
+        }
+
+        if (currentPhrase.pause) {
+          const pauseBeats = currentPhrase.punctuation === "," ? 0.18
+            : currentPhrase.punctuation === "!" ? 0.4 : 0.48;
+          output.push({
+            key: "rest",
+            ...phonemeMap.rest,
+            d: beatsToSeconds(pauseBeats),
+            pitch: cadenceEndPitch,
+            pitchIsNote: false,
+            talkingMode: !monotoneModeOverride,
+            monotoneMode: monotoneModeOverride,
+          });
+        }
+        phraseIndex++;
+      }
+      return output;
+    };
+
+    if (talkingModeOverride || monotoneModeOverride) return parseTalkingInput();
+
     const regex = /(\[[^\]]*\])?\s*([a-zA-Z']+(?:\s+[a-zA-Z']+)*)\s*<\s*([^>]+)\s*>/gi;
     const result = [];
-    const defaultSettings = { fs: 1, vd: null, vf: null, vde: null, vfa: null, vfao: null, slide: null, fmorph: null, portamento: null };
+    const defaultSettings = {
+      fs: 1, vd: null, vf: null, vde: null, vfa: null, vfao: null,
+      slide: null, fmorph: null, portamento: null,
+      defaultPitch: defaultPitchOverride, oscillatorType: null,
+    };
     let persistentSettings = { ...defaultSettings };
-    let currentPitch = noteToFreq("C4");
+    let currentPitch = defaultPitchOverride;
     let currentPitchIsNote = true;
     let match;
     while ((match = regex.exec(text)) !== null) {
       const bracketText = match[1] || "";
-      if (/\breset\b/i.test(bracketText)) persistentSettings = { ...defaultSettings };
-      Object.assign(persistentSettings, parseBracketSettings(bracketText));
+      const resettingSettings = /\breset\b/i.test(bracketText);
+      if (resettingSettings) persistentSettings = { ...defaultSettings };
+      const parsedBracketSettings = parseBracketSettings(bracketText);
+      Object.assign(persistentSettings, parsedBracketSettings);
+      if (!Number.isFinite(persistentSettings.defaultPitch) || persistentSettings.defaultPitch <= 0) {
+        throw new RangeError("Default pitch must be a positive finite frequency in Hz.");
+      }
+      if (resettingSettings || Object.hasOwn(parsedBracketSettings, "defaultPitch")) {
+        currentPitch = persistentSettings.defaultPitch;
+        currentPitchIsNote = false;
+      }
       const settings = { ...persistentSettings };
       const tokenRaw = match[2];
       const token = tokenRaw.trim().toLowerCase();
@@ -287,8 +569,8 @@ const stopPreview = () => {
       // exact phoneme key match
       if (!hasSeparatedPhonemes && phonemeMap[token]) {
         let p = { key: token, ...phonemeMap[token], d: dur, pitch, pitchIsNote: currentPitchIsNote };
-        p.f = getAdjustedFormants(p.f);
-        if (p.morphTo) p.morphTo = getAdjustedFormants(p.morphTo);
+        p.f = getAdjustedFormants(p.f, genderShiftOverride);
+        if (p.morphTo) p.morphTo = getAdjustedFormants(p.morphTo, genderShiftOverride);
 
         applyPerNoteVibrato(p, settings, beatLen, vibFreqHz, vibDelayBeats, vibFadeInBeats, vibSpeedBeats);
 
@@ -302,15 +584,15 @@ const stopPreview = () => {
         : await textToPhonemes(tokenRaw);
       if (!parts || parts.length === 0) continue;
       let partDurations = parts.map(() => dur / Math.max(1, parts.length));
-      if (dynamicMode) {
+      if (dynamicModeOverride) {
         const consonantCount = parts.filter(part => DYNAMIC_CONSONANTS.has(part.toLowerCase())).length;
         const vowelCount = parts.length - consonantCount;
-        const consonantBudget = consonantCount * Math.min(consonantDuration, dur / Math.max(1, consonantCount));
+        const consonantBudget = consonantCount * Math.min(consonantDurationOverride, dur / Math.max(1, consonantCount));
         const vowelDuration = vowelCount > 0
           ? Math.max(0, dur - consonantBudget) / vowelCount
           : 0;
         partDurations = parts.map(part => DYNAMIC_CONSONANTS.has(part.toLowerCase())
-          ? Math.min(consonantDuration, dur / Math.max(1, consonantCount))
+          ? Math.min(consonantDurationOverride, dur / Math.max(1, consonantCount))
           : vowelDuration);
       }
       for (let partIndex = 0; partIndex < parts.length; partIndex++) {
@@ -318,9 +600,9 @@ const stopPreview = () => {
         const partDur = partDurations[partIndex];
         const key = part.toLowerCase();
         if (phonemeMap[key]) {
-          let p = { key, ...phonemeMap[key], d: partDur, pitch, pitchIsNote: currentPitchIsNote, dynamicDurationApplied: dynamicMode };
-          p.f = getAdjustedFormants(p.f);
-          if (p.morphTo) p.morphTo = getAdjustedFormants(p.morphTo);
+          let p = { key, ...phonemeMap[key], d: partDur, pitch, pitchIsNote: currentPitchIsNote, dynamicDurationApplied: dynamicModeOverride };
+          p.f = getAdjustedFormants(p.f, genderShiftOverride);
+          if (p.morphTo) p.morphTo = getAdjustedFormants(p.morphTo, genderShiftOverride);
 
           applyPerNoteVibrato(p, settings, beatLen, vibFreqHz, vibDelayBeats, vibFadeInBeats, vibSpeedBeats);
 
@@ -333,9 +615,9 @@ const stopPreview = () => {
             ng: "ng", er: "er", oy: "oy", aw: "aw"
           };
           const fm = (fallbackMap[key] || "rest");
-          let p = { key: fm, ...phonemeMap[fm], d: partDur, pitch, pitchIsNote: currentPitchIsNote, dynamicDurationApplied: dynamicMode };
-          p.f = getAdjustedFormants(p.f);
-          if (p.morphTo) p.morphTo = getAdjustedFormants(p.morphTo);
+          let p = { key: fm, ...phonemeMap[fm], d: partDur, pitch, pitchIsNote: currentPitchIsNote, dynamicDurationApplied: dynamicModeOverride };
+          p.f = getAdjustedFormants(p.f, genderShiftOverride);
+          if (p.morphTo) p.morphTo = getAdjustedFormants(p.morphTo, genderShiftOverride);
 
           applyPerNoteVibrato(p, settings, beatLen, vibFreqHz, vibDelayBeats, vibFadeInBeats, vibSpeedBeats);
 
@@ -391,7 +673,7 @@ const stopPreview = () => {
     return (usePinkNoise || voiced) ? createPinkNoiseBuffer(ctx, duration, amp) : createWhiteNoiseBuffer(ctx, duration, amp);
   };
 
-  const getVoicedGain = (amp) => amp * 0.89 * (oscType === "rosenberg" ? ROSENBERG_GAIN_BOOST : 1);
+  const getVoicedGain = (amp, type = oscType) => amp * 0.89 * (type === "rosenberg" ? ROSENBERG_GAIN_BOOST : 1);
 
   // Rosenberg (1971) glottal pulse model.
   // Builds one period of the classic glottal FLOW waveform:
@@ -553,9 +835,9 @@ const stopPreview = () => {
   };
 
   // Create an oscillator configured per the selected experimental oscillator type.
-  const createSelectedOsc = (ctx) => {
+  const createSelectedOsc = (ctx, type = oscType) => {
     const osc = ctx.createOscillator();
-    const t = oscType || "rosenberg";
+    const t = type || "rosenberg";
     if (t === "sawtooth") osc.type = "sawtooth";
     else if (t === "square") osc.type = "square";
     else if (t === "lf") {
@@ -811,7 +1093,7 @@ const stopPreview = () => {
     for (let index = 0; index < phonemeSeq.length; index++) {
       const phoneme = phonemeSeq[index];
       const duration = Math.max(0.001, phoneme.d);
-      const next = phonemeSeq[index + 1];
+      const next = phoneme.modeBoundaryAfter ? null : phonemeSeq[index + 1];
       const rawSample = getConcatenativeSample(ctx, phoneme.key, phoneme, morphEnabled) || (phoneme.key === "rest" ? null : concatenativeSamples.get("rest"));
       const sample = rawSample ? getPreparedConcatenativeSample(ctx, rawSample) : null;
       if (!sample) {
@@ -965,9 +1247,15 @@ const stopPreview = () => {
   };
 
   // synthesize with nasal-aware transitions and humanizing features
-  const synthesize = async (ctx, phonemeSeq, mode, vibFreq, vibDepth, vibDelay, morphTime = 0.05, morphEnabled = true, slideTime = 0.08, portamento = 0.08, persistentVib = true, dynamicMode = false, consonantDuration = 0.1, globalVibFadeIn = 0, method = synthesisMethod, beatLength = 0.5) => {
+  const synthesize = async (ctx, phonemeSeq, mode, vibFreq, vibDepth, vibDelay, morphTime = 0.05, morphEnabled = true, slideTime = 0.08, portamento = 0.08, persistentVib = true, dynamicMode = false, consonantDuration = 0.1, globalVibFadeIn = 0, method = synthesisMethod, beatLength = 0.5, oscillatorType = oscType) => {
     if (method === "concatenative") {
       return renderConcatenative(ctx, phonemeSeq, mode, morphTime, morphEnabled, slideTime, portamento, vibFreq, vibDepth, vibDelay, persistentVib, globalVibFadeIn);
+    }
+    const supportedOscillatorTypes = ["rosenberg", "lf", "sawtooth", "square", "custom"];
+    for (const phoneme of phonemeSeq) {
+      if (phoneme.oscillatorType != null && !supportedOscillatorTypes.includes(phoneme.oscillatorType)) {
+        throw new RangeError("Oscillator type must be rosenberg, lf, sawtooth, square, or custom.");
+      }
     }
     // Preprocess phonemeSeq for humanizing features
     const processedSeq = [];
@@ -1450,13 +1738,16 @@ const hasMorphTo = voiceFilters.length > 0 && morphEnabled && opt.morphTo && opt
       } else {
         pitchParam.setValueAtTime(pitch, t);
       }
+      if (!opt.modeBoundaryAfter && Number.isFinite(opt.pitchEnd) && opt.pitchEnd > 0) {
+        pitchParam.linearRampToValueAtTime(opt.pitchEnd, t + d);
+      }
 
       // route oscillator through per-formant filters/gains
       const oscGain = ctx.createGain();
       const fadeTime = 0.01;
       oscGain.gain.setValueAtTime(0, t);
-      oscGain.gain.linearRampToValueAtTime(getVoicedGain(amp), t + fadeTime);
-      oscGain.gain.setValueAtTime(getVoicedGain(amp), t + d - fadeTime);
+      oscGain.gain.linearRampToValueAtTime(getVoicedGain(amp, oscillatorType), t + fadeTime);
+      oscGain.gain.setValueAtTime(getVoicedGain(amp, oscillatorType), t + d - fadeTime);
       oscGain.gain.linearRampToValueAtTime(0, t + d);
       if (voiceFilters.length > 0) {
         for (const filter of voiceFilters) osc.connect(oscGain).connect(filter);
@@ -1503,6 +1794,7 @@ const hasMorphTo = voiceFilters.length > 0 && morphEnabled && opt.morphTo && opt
 
     // continuous oscillator for voiced sequences
     let currentOsc = null;
+    let activeOscillatorType = oscillatorType;
     let oscGain = null;
     let lastVoicedEnd = 0;
     let currentAmp = 0.9;
@@ -1517,7 +1809,8 @@ const hasMorphTo = voiceFilters.length > 0 && morphEnabled && opt.morphTo && opt
     let whisperRunStart = true;
     for (let i = 0; i < processedSeq.length; i++) {
       const p = processedSeq[i];
-      const immediateNext = processedSeq[i + 1] || null;
+      const phonemeOscillatorType = p.oscillatorType ?? oscillatorType;
+      const immediateNext = p.modeBoundaryAfter ? null : processedSeq[i + 1] || null;
       const nextVoiced = findNextVoiced(i);
 
       if (mode === "whisper") {
@@ -1530,19 +1823,34 @@ const hasMorphTo = voiceFilters.length > 0 && morphEnabled && opt.morphTo && opt
           whisperRunStart = false;
         }
       } else if (p.voiced) {
+        if (currentOsc && activeOscillatorType !== phonemeOscillatorType) {
+          const typeChangeFade = Math.min(0.008, p.d * 0.25);
+          oscGain.gain.cancelScheduledValues(t);
+          oscGain.gain.setValueAtTime(getVoicedGain(currentAmp, activeOscillatorType), t);
+          oscGain.gain.linearRampToValueAtTime(0, t + typeChangeFade);
+          if (vibConnected && lfoGain) {
+            try { lfoGain.disconnect(currentOsc.frequency); } catch (e) {}
+            vibConnected = false;
+          }
+          currentOsc.stop(t + typeChangeFade);
+          currentOsc = null;
+          oscGain = null;
+          voicedFadeOutScheduled = false;
+        }
         if (p.burst) {
           playConsonantNoise(t, p.d, p.f, p.amp, p.noiseAmp ?? 1, 0, p.dynamicFadeOut, p.key === "s" ? 0.5 : 0, Boolean(p.voiced), p.usePinkNoise);
         }
         const isRunStart = !currentOsc;
         if (!currentOsc) {
           // start new oscillator for voiced sequence
-          currentOsc = createSelectedOsc(ctx);
+          activeOscillatorType = phonemeOscillatorType;
+          currentOsc = createSelectedOsc(ctx, activeOscillatorType);
 
           oscGain = ctx.createGain();
           const fadeTime = 0.01;
           const amp = isNaN(p.amp) ? 1 : p.amp;
           oscGain.gain.setValueAtTime(0, t);
-          oscGain.gain.linearRampToValueAtTime(getVoicedGain(amp), t + fadeTime);
+          oscGain.gain.linearRampToValueAtTime(getVoicedGain(amp, activeOscillatorType), t + fadeTime);
           currentAmp = amp;
           if (voiceFilters.length > 0) {
             for (const filter of voiceFilters) currentOsc.connect(oscGain).connect(filter);
@@ -1555,14 +1863,17 @@ const hasMorphTo = voiceFilters.length > 0 && morphEnabled && opt.morphTo && opt
         if (voicedFadeOutScheduled) {
           const fadeInEnd = t + Math.min(0.01, p.d);
           oscGain.gain.setValueAtTime(0, t);
-          oscGain.gain.linearRampToValueAtTime(getVoicedGain(voicedAmp), fadeInEnd);
+          oscGain.gain.linearRampToValueAtTime(getVoicedGain(voicedAmp, activeOscillatorType), fadeInEnd);
           currentAmp = voicedAmp;
           voicedFadeOutScheduled = false;
         }
 
         // schedule pitch
         const pitchParam = currentOsc.frequency;
-        const prevVoiced = i > 0 ? processedSeq[i - 1] : null;
+        const previousPhone = i > 0 ? processedSeq[i - 1] : null;
+        const prevVoiced = p.modeBoundaryBefore || previousPhone?.modeBoundaryAfter
+          ? null
+          : previousPhone;
         const effectiveSlideTime = resolvePortamento(p.slideTime ?? slideTime, slideTime, p.d);
         const effectivePortamento = resolvePortamento(p.portamento ?? portamento, portamento, p.d);
         const prevSlideTarget = prevVoiced && prevVoiced.voiced && prevVoiced.pitch && p.voiced && p.pitch
@@ -1581,6 +1892,9 @@ const hasMorphTo = voiceFilters.length > 0 && morphEnabled && opt.morphTo && opt
           pitchParam.setValueAtTime(p.pitch, t + blendDuration);
         } else {
           pitchParam.setValueAtTime(p.pitch, t);
+        }
+        if (!p.modeBoundaryAfter && Number.isFinite(p.pitchEnd) && p.pitchEnd > 0) {
+          pitchParam.linearRampToValueAtTime(p.pitchEnd, t + p.d);
         }
 
         // vibrato — per-phoneme aware: uses p.vib* fields from bracket overrides,
@@ -1659,7 +1973,7 @@ const hasMorphTo = voiceFilters.length > 0 && morphEnabled && opt.morphTo && opt
           const fadeDuration = 0.05 * finalBeat;
           const fadeEnd = lastVoicedEnd - silenceDuration;
           const fadeStart = fadeEnd - fadeDuration;
-          oscGain.gain.setValueAtTime(getVoicedGain(currentAmp), fadeStart);
+          oscGain.gain.setValueAtTime(getVoicedGain(currentAmp, activeOscillatorType), fadeStart);
           oscGain.gain.linearRampToValueAtTime(0, fadeEnd);
           voicedFadeOutScheduled = true;
         }
@@ -1738,7 +2052,7 @@ const hasMorphTo = voiceFilters.length > 0 && morphEnabled && opt.morphTo && opt
           // stop the oscillator with fade-out
           const fadeTime = 0.01;
           if (!voicedFadeOutScheduled) {
-            oscGain.gain.setValueAtTime(getVoicedGain(currentAmp), lastVoicedEnd - fadeTime);
+            oscGain.gain.setValueAtTime(getVoicedGain(currentAmp, activeOscillatorType), lastVoicedEnd - fadeTime);
             oscGain.gain.linearRampToValueAtTime(0, lastVoicedEnd);
           }
           currentOsc.stop(lastVoicedEnd);
@@ -1818,6 +2132,99 @@ const hasMorphTo = voiceFilters.length > 0 && morphEnabled && opt.morphTo && opt
     };
     prevSrc.start();
   };
+
+  if (headless) {
+    const OfflineContext = options.OfflineAudioContext;
+    if (typeof OfflineContext !== "function") {
+      throw new TypeError("Headless synthesis requires an OfflineAudioContext constructor.");
+    }
+
+    const parseText = async (text, {
+      bpm = 120,
+      gridType = "beats",
+      stepsPerBeat = 4,
+      dynamicMode: dynamicModeOverride,
+      consonantDuration: consonantDurationOverride,
+      genderShift: genderShiftOverride,
+      talkingMode: talkingModeOverride,
+      defaultPitch: defaultPitchOverride,
+      monotoneMode: monotoneModeOverride,
+    } = {}) => {
+      if (typeof text !== "string") throw new TypeError("Synthesis input must be a string.");
+      if (!Number.isFinite(bpm) || bpm <= 0) throw new RangeError("BPM must be a positive finite number.");
+      if (!Number.isFinite(stepsPerBeat) || stepsPerBeat <= 0) {
+        throw new RangeError("Steps per beat must be a positive finite number.");
+      }
+      return parseInput(text, 60 / bpm, gridType, stepsPerBeat, {
+        dynamicMode: dynamicModeOverride,
+        consonantDuration: consonantDurationOverride,
+        genderShift: genderShiftOverride,
+        talkingMode: talkingModeOverride,
+        defaultPitch: defaultPitchOverride,
+        monotoneMode: monotoneModeOverride,
+      });
+    };
+
+    const renderPhonemes = async (phonemeSequence, renderOptions = {}) => {
+      if (!Array.isArray(phonemeSequence) || phonemeSequence.length === 0) {
+        throw new TypeError("At least one parsed phoneme is required to render audio.");
+      }
+      if (phonemeSequence.some(phoneme => !Number.isFinite(phoneme.d) || phoneme.d <= 0)) {
+        throw new RangeError("Every phoneme must have a positive finite duration.");
+      }
+
+      const outputSampleRate = renderOptions.sampleRate ?? sampleRate;
+      if (!Number.isInteger(outputSampleRate) || outputSampleRate < 8000 || outputSampleRate > 192000) {
+        throw new RangeError("Sample rate must be an integer between 8000 and 192000 Hz.");
+      }
+      const method = renderOptions.synthesisMethod ?? synthesisMethod;
+      const oscillatorType = renderOptions.oscillatorType ?? renderOptions.oscType ?? oscType;
+      if (!["rosenberg", "lf", "sawtooth", "square", "custom"].includes(oscillatorType)) {
+        throw new RangeError("Oscillator type must be rosenberg, lf, sawtooth, square, or custom.");
+      }
+      const renderSampleRate = method === "synthesized" ? 22050 : outputSampleRate;
+      const totalDuration = phonemeSequence.reduce((total, phoneme) => total + phoneme.d, 0);
+      const context = new OfflineContext(1, Math.ceil(totalDuration * renderSampleRate) + 128, renderSampleRate);
+      const sequence = phonemeSequence.map(phoneme => ({
+        ...phoneme,
+        f: phoneme.f?.slice(),
+        morphTo: phoneme.morphTo?.slice(),
+      }));
+      const rendered = await synthesize(
+        context,
+        sequence,
+        renderOptions.mode ?? "voiced",
+        renderOptions.vibratoFreq ?? 6,
+        renderOptions.vibratoDepth ?? 5,
+        renderOptions.vibratoDelay ?? 0.1,
+        renderOptions.formantMorphTime ?? renderOptions.morphTime ?? 0.06,
+        renderOptions.formantMorph ?? renderOptions.enableMorph ?? true,
+        renderOptions.slideTime ?? renderOptions.slide ?? 0.08,
+        renderOptions.portamento ?? 0.08,
+        renderOptions.persistentVib ?? true,
+        renderOptions.dynamicMode ?? dynamicMode,
+        renderOptions.consonantDuration ?? consonantDuration,
+        renderOptions.vibratoFadeIn ?? 0,
+        method,
+        60 / (renderOptions.bpm ?? 120),
+        oscillatorType
+      );
+      const samples = resampleAudio(rendered.getChannelData(0), rendered.sampleRate, outputSampleRate);
+      return { samples, sampleRate: outputSampleRate, duration: samples.length / outputSampleRate };
+    };
+
+    return {
+      parseText,
+      renderPhonemes,
+      async renderText(text, renderOptions = {}) {
+        const phonemes = await parseText(text, renderOptions);
+        if (phonemes.length === 0) {
+          throw new Error("No phonemes were parsed from the input text.");
+        }
+        return { ...await renderPhonemes(phonemes, renderOptions), phonemes };
+      },
+    };
+  }
 
   // UI: minimal container (controls same as previous iterations)
   // Enable page scrolling
@@ -1933,6 +2340,14 @@ const hasMorphTo = voiceFilters.length > 0 && morphEnabled && opt.morphTo && opt
       <label>Voice mode:
         <select id="voiceMode"><option value="voiced" selected>Voiced</option><option value="whisper">Whisper</option></select>
       </label>
+      <label style="margin-left:8px">Pitch mode:
+        <select id="talkingMode">
+          <option value="singing" selected>Singing</option>
+          <option value="talking">Talking</option>
+          <option value="monotone">Monotone</option>
+        </select>
+      </label>
+      <label style="margin-left:8px">Default pitch (Hz): <input type="number" id="defaultPitch" value="${defaultPitch}" min="1" step="1" style="width:80px"/></label>
       <label style="margin-left:8px">BPM: <input type="number" id="bpm" value="120" style="width:80px"/></label>
       <label style="margin-left:8px">Grid:
         <select id="gridType"><option value="beats" selected>Beats</option><option value="steps">Steps</option><option value="seconds">Seconds</option></select>
@@ -2052,10 +2467,17 @@ const hasMorphTo = voiceFilters.length > 0 && morphEnabled && opt.morphTo && opt
     <div><b>Basic note</b></div>
     <pre style="white-space:pre-wrap;margin:4px 0 8px;">a &lt;C4,1&gt; e &lt;1&gt;
 rest &lt;0.25&gt;</pre>
+    <div><b>Talking and Monotone modes</b></div>
+    <pre style="white-space:pre-wrap;margin:4px 0 8px;">ay n ee d. ay n ee d.. ay n ee d!!</pre>
+    <div>In Talking mode, single punctuation changes pitch without pausing. Double punctuation (<code>..</code>, <code>,,</code>, <code>!!</code>) also adds a pause. Monotone keeps the selected default pitch while using automatic Klatt-inspired timing. Use <code>&lt;duration&gt;</code> to override one phoneme in the selected beats/steps grid.</div>
+    <div style="margin-top:6px;">Switch modes in the text with persistent <code>[talking]</code>, <code>[monotone]</code>, and <code>[singing]</code> markers. For example:</div>
+    <pre style="white-space:pre-wrap;margin:4px 0 8px;">[talking] ay n ee d. [monotone] s p ee k. [singing] a &lt;C4,1&gt;</pre>
     <div><b>Persistent settings</b></div>
     <pre style="white-space:pre-wrap;margin:4px 0 8px;">[fs:1.2, vf:6, vd:5, vde:0.1, vfa:0.2, vfao:0.1] a &lt;C4,1&gt;
 e &lt;1&gt;   settings continue here
 [reset] i &lt;1&gt;   restore defaults</pre>
+    <pre style="white-space:pre-wrap;margin:4px 0 8px;">[defaultPitch:220, osc:square] ay &lt;1&gt;
+[osc:lf] n &lt;1&gt;</pre>
     <div>Settings also accept <code>fs=1.2</code> or <code>fs 1.2</code>. <code>vdae</code> is accepted as an alias for <code>vde</code>.</div>
     <div style="margin-top:6px;"><b>Pitch and formant settings</b></div>
     <pre style="white-space:pre-wrap;margin:4px 0 8px;">[sl:0.12] a &lt;C4,1&gt;   slide time (same as slide)
@@ -2475,6 +2897,22 @@ vibFadeIn, vibSpeed</pre>
   });
 
   const synthBtn = container.querySelector("#synthBtn");
+  const defaultPitchEl = container.querySelector("#defaultPitch");
+  defaultPitchEl.addEventListener("change", () => {
+    const value = Number(defaultPitchEl.value);
+    if (!Number.isFinite(value) || value <= 0) {
+      defaultPitchEl.value = String(defaultPitch);
+      statusEl.textContent = "Default pitch must be a positive frequency in Hz.";
+      return;
+    }
+    defaultPitch = value;
+  });
+  const talkingModeEl = container.querySelector("#talkingMode");
+  talkingModeEl.value = monotoneMode ? "monotone" : talkingMode ? "talking" : "singing";
+  talkingModeEl.addEventListener("change", () => {
+    talkingMode = talkingModeEl.value !== "singing";
+    monotoneMode = talkingModeEl.value === "monotone";
+  });
   const outputControls = container.querySelector("#outputControls");
   const statusEl = container.querySelector("#status");
   const sampleRateEl = container.querySelector("#sampleRate");
@@ -2847,7 +3285,12 @@ vibFadeIn, vibSpeed</pre>
       const slideTime = slideValue === "" ? 0.08 : resolvePortamento(slideValue, 0.08, 0.08);
       const portamento = portamentoValue === "" ? 0.08 : resolvePortamento(portamentoValue, 0.08, 0.08);
 
-      const phonemeSeq = await parseInput(text, beatLen, gridType, stepsPerBeat);
+      const pitchValue = Number(defaultPitchEl.value);
+      if (!Number.isFinite(pitchValue) || pitchValue <= 0) {
+        throw new RangeError("Default pitch must be a positive frequency in Hz.");
+      }
+      defaultPitch = pitchValue;
+      const phonemeSeq = await parseInput(text, beatLen, gridType, stepsPerBeat, { defaultPitch });
       if (!phonemeSeq || phonemeSeq.length === 0) { statusEl.textContent = "Parsed no phonemes â€” check input."; return; }
 
       const totalDuration = phonemeSeq.reduce((a,p) => a + p.d, 0);
@@ -4718,4 +5161,8 @@ vibFadeIn, vibSpeed</pre>
   drawPianoRoll();
   updatePianoRollPanel();
 
+}
+
+export async function createSynthEngine(options = {}) {
+  return initializeJSSynth({ ...options, headless: true });
 }
